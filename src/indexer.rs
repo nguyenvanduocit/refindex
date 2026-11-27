@@ -28,6 +28,12 @@ pub fn embed_text(repo: &str, path: &str, c: &Chunk, lines: &[&str]) -> String {
         s.push(' ');
         s.push_str(&c.qualname);
     }
+    // A continuation piece repeats the signature it belongs to, so its vector knows whose
+    // body this is.
+    if c.sig > 0 && c.sig < c.start && let Some(l) = lines.get(c.sig - 1) {
+        s.push('\n');
+        s.push_str(l.trim());
+    }
     s.push('\n');
     let mut body = String::new();
     for l in lines.get(c.start - 1..c.end.min(lines.len())).unwrap_or(&[]) {
@@ -149,7 +155,7 @@ fn parse(repo: &str, root: &Path, path: &str, blob: &str, lang: &'static str,
         let hash = hash_of(&embed_text(repo, path, &c, &lines));
         let bugs: Vec<String> = chunk::bug_refs(&raw).into_iter().collect();
         out.push(ParsedChunk {
-            ids: chunk::identifiers(&raw).into_iter().collect(),
+            ids: c.refs.clone().unwrap_or_else(|| chunk::identifiers(&raw).into_iter().collect()),
             evidence: chunk::is_evidence(&c.name, test, !bugs.is_empty()),
             cites: if repo.starts_with('@') { chunk::citations(&raw, peers) } else { vec![] },
             mentions: vocab.mentions(repo, &c.name, &raw, &bugs),
@@ -250,8 +256,8 @@ pub fn index(paths: &Paths, only: &[String]) -> Result<()> {
             let mut ins_file = tx.prepare_cached(
                 "INSERT INTO files(repo_id, path, blob, lang, is_test) VALUES(?1,?2,?3,?4,?5)")?;
             let mut ins_chunk = tx.prepare_cached(
-                "INSERT INTO chunks(file_id, start, end, kind, name, qualname, hash, evidence)
-                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8)")?;
+                "INSERT INTO chunks(file_id, start, end, kind, name, qualname, hash, evidence, sig)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
             let mut ins_cite = tx.prepare_cached("INSERT INTO cites VALUES(?1,?2,?3,?4,?5,?6)")?;
             let mut ins_mention = tx.prepare_cached("INSERT OR IGNORE INTO mentions VALUES(?1,?2)")?;
             let mut ins_def = tx.prepare_cached("INSERT OR IGNORE INTO defs VALUES(?1,?2)")?;
@@ -263,7 +269,7 @@ pub fn index(paths: &Paths, only: &[String]) -> Result<()> {
                 let fid = tx.last_insert_rowid();
                 for pc in f.chunks {
                     let c = &pc.c;
-                    ins_chunk.execute(params![fid, c.start, c.end, c.kind, c.name, c.qualname, &pc.hash[..], pc.evidence])?;
+                    ins_chunk.execute(params![fid, c.start, c.end, c.kind, c.name, c.qualname, &pc.hash[..], pc.evidence, c.sig])?;
                     let cid = tx.last_insert_rowid();
                     for ct in &pc.cites {
                         ins_cite.execute(params![cid, ct.repo, ct.path, ct.start, ct.end, ct.context])?;
@@ -402,7 +408,8 @@ fn learn_concepts(db: &Connection) -> Result<()> {
          JOIN defs d ON d.chunk_id=c.id JOIN names n ON n.id=d.name_id
          WHERE r.name=?1 AND f.path=?2 AND (?3=0 OR (c.start<=?4 AND c.end>=?3)) AND n.ndefs <= 40")?;
     let mut df: HashMap<String, usize> = HashMap::new();
-    let mut pairs: HashMap<(String, String), f64> = HashMap::new();
+    // (weight, citations that pair the two): a pair seen once is a coincidence of one sentence.
+    let mut pairs: HashMap<(String, String), (f64, usize)> = HashMap::new();
     let word = regex::Regex::new(r"[A-Za-z][a-z]{3,}")?;
     for (_, repo, path, s, e, ctx) in &rows {
         let names: Vec<String> = target_names.query_map(params![repo, path, s, e], |r| r.get(0))?
@@ -417,14 +424,21 @@ fn learn_concepts(db: &Connection) -> Result<()> {
         for t in &terms {
             *df.entry(t.clone()).or_default() += 1;
             for n in &names {
-                *pairs.entry((t.clone(), n.clone())).or_default() += 1.0 / names.len() as f64;
+                let p = pairs.entry((t.clone(), n.clone())).or_default();
+                p.0 += 1.0 / names.len() as f64;
+                p.1 += 1;
             }
         }
     }
     let total = rows.len().max(1) as f64;
     db.execute("DELETE FROM concept_links", [])?;
     let mut ins = db.prepare("INSERT INTO concept_links VALUES(?1,?2,?3)")?;
-    for ((t, n), c) in pairs {
+    for ((t, n), (c, seen)) in pairs {
+        // Kept only when two citations agree, and the word is not one that surrounds a tenth
+        // of all citations (such words say nothing about the cited code).
+        if seen < 2 || df[&t] as f64 > total * 0.1 {
+            continue;
+        }
         let w = c * (1.0 + total / df[&t] as f64).ln();
         ins.execute(params![t, n, w])?;
     }
@@ -437,13 +451,14 @@ pub fn embed(paths: &Paths, limit: Option<usize>, batch: usize) -> Result<()> {
     let db = store::open(&paths.db, false)?;
     let model = Embedder::load()?;
     let have = vecs::Vectors::load(&paths.vecs)?.map(|v| v.hashes()).unwrap_or_default();
-    let mut rows: Vec<(Vec<u8>, String, String, usize, usize, String, String)> = db
+    type Row = (Vec<u8>, String, String, usize, usize, String, String, usize);
+    let mut rows: Vec<Row> = db
         .prepare(
-            "SELECT c.hash, r.name, f.path, c.start, c.end, c.kind, c.qualname
+            "SELECT c.hash, r.name, f.path, c.start, c.end, c.kind, c.qualname, c.sig
              FROM chunks c JOIN files f ON f.id=c.file_id JOIN repos r ON r.id=f.repo_id
              GROUP BY c.hash ORDER BY c.end - c.start",
         )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
         .collect::<rusqlite::Result<_>>()?;
     rows.retain(|r| r.0.len() == 16 && !have.contains(&<Hash>::try_from(&r.0[..]).unwrap()));
     if let Some(l) = limit {
@@ -457,7 +472,7 @@ pub fn embed(paths: &Paths, limit: Option<usize>, batch: usize) -> Result<()> {
     let mut done = 0;
     for part in rows.chunks(batch) {
         let mut texts = Vec::with_capacity(part.len());
-        for (_, repo, path, s, e, kind, qual) in part {
+        for (_, repo, path, s, e, kind, qual, sig) in part {
             if files.len() > 4000 {
                 files.clear();
             }
@@ -468,7 +483,7 @@ pub fn embed(paths: &Paths, limit: Option<usize>, batch: usize) -> Result<()> {
                     .unwrap_or_default());
             let lines: Vec<&str> = src.split('\n').collect();
             let c = Chunk { start: *s, end: *e, kind: kind.clone(), name: qual.clone(),
-                            qualname: qual.clone(), defines: vec![] };
+                            qualname: qual.clone(), defines: vec![], sig: *sig, refs: None };
             texts.push(embed_text(repo, path, &c, &lines));
         }
         let v = model.encode(&texts)?;

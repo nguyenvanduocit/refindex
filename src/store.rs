@@ -5,6 +5,10 @@ use std::path::Path;
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, params};
 
+/// Index format. Bump when chunking or the stored graph changes meaning, so an old index is
+/// rebuilt instead of mixed with new chunks.
+pub const FORMAT: i64 = 2;
+
 const SCHEMA: &str = "
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -14,7 +18,7 @@ CREATE TABLE IF NOT EXISTS files(
   UNIQUE(repo_id, path));
 CREATE TABLE IF NOT EXISTS chunks(
   id INTEGER PRIMARY KEY, file_id INTEGER, start INTEGER, end INTEGER, kind TEXT,
-  name TEXT, qualname TEXT, hash BLOB, evidence INTEGER DEFAULT 0);
+  name TEXT, qualname TEXT, hash BLOB, evidence INTEGER DEFAULT 0, sig INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS cites(chunk_id INTEGER, repo TEXT, path TEXT, start INTEGER, end INTEGER,
   context TEXT);
 CREATE TABLE IF NOT EXISTS mentions(chunk_id INTEGER, entity TEXT, PRIMARY KEY(entity, chunk_id)) WITHOUT ROWID;
@@ -46,8 +50,17 @@ pub fn open(path: &Path, readonly: bool) -> Result<Connection> {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?
     } else {
         std::fs::create_dir_all(path.parent().unwrap())?;
+        let fresh = !path.exists();
         let db = Connection::open(path)?;
+        let v: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        anyhow::ensure!(
+            fresh || v == FORMAT,
+            "{} was built by an older refx (format {v}, now {FORMAT}): chunking changed. Remove it \
+             and the fts/ directory beside it, then run `refx index`; vectors.bin is reused",
+            path.display()
+        );
         db.execute_batch(SCHEMA)?;
+        db.execute_batch(&format!("PRAGMA user_version={FORMAT}"))?;
         db
     };
     db.execute_batch("PRAGMA cache_size=-262144; PRAGMA mmap_size=4294967296;")?;

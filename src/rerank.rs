@@ -17,7 +17,8 @@ use tokenizers::{EncodeInput, PaddingParams, PaddingStrategy, Tokenizer, Truncat
 use crate::embed;
 
 pub const MODEL: &str = "ibm-granite/granite-embedding-reranker-english-r2";
-pub const MAX_TOKENS: usize = 384;
+pub const MAX_TOKENS: usize = 256;
+const BATCH: usize = 16;
 
 pub struct Reranker {
     model: ModernBert,
@@ -32,7 +33,7 @@ pub struct Reranker {
 impl Reranker {
     pub fn load() -> Result<Self> {
         let dir = embed::model_dir_for(MODEL)?;
-        let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        let device = embed::device();
         let mut raw: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let act = raw["classifier_activation"].as_str().unwrap_or("gelu").to_string();
         let obj = raw.as_object_mut().ok_or_else(|| anyhow!("bad config"))?;
@@ -59,10 +60,19 @@ impl Reranker {
 
     /// Relevance in [0, 1] of each document to the query.
     pub fn score(&self, query: &str, docs: &[String]) -> Result<Vec<f32>> {
-        let mut out = Vec::with_capacity(docs.len());
-        for part in docs.chunks(16) {
+        // Tokenize once, then batch by length so a batch pads to its own longest pair, not to
+        // the longest of all.
+        let pairs: Vec<EncodeInput> =
+            docs.iter().map(|d| EncodeInput::Dual(query.into(), d.as_str().into())).collect();
+        let all = self.tok.encode_batch(pairs, false).map_err(|e| anyhow!("{e}"))?;
+        let mut order: Vec<usize> = (0..docs.len()).collect();
+        // The tokenizer pads every batch, this one included: length = unmasked tokens.
+        order.sort_by_key(|&i| all[i].get_attention_mask().iter().filter(|&&m| m != 0).count());
+        let mut out = vec![0f32; docs.len()];
+        for part in order.chunks(BATCH) {
             let pairs: Vec<EncodeInput> =
-                part.iter().map(|d| EncodeInput::Dual(query.into(), d.as_str().into())).collect();
+                part.iter().map(|&i| EncodeInput::Dual(query.into(), docs[i].as_str().into())).collect();
+            let t = std::time::Instant::now();
             let enc = self.tok.encode_batch(pairs, true).map_err(|e| anyhow!("{e}"))?;
             let (b, n) = (enc.len(), enc[0].get_ids().len());
             let ids: Vec<u32> = enc.iter().flat_map(|e| e.get_ids().iter().copied()).collect();
@@ -76,7 +86,12 @@ impl Reranker {
             let x = if self.silu { candle_nn::ops::silu(&x)? } else { x.gelu_erf()? };
             let logits = self.classifier.forward(&self.norm.forward(&x)?)?; // (b, 1)
             let p = candle_nn::ops::sigmoid(&logits)?.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?;
-            out.extend(p);
+            if std::env::var_os("REFX_TIMING").is_some() {
+                eprintln!("rerank batch {b}x{n}: {:?}", t.elapsed());
+            }
+            for (&i, s) in part.iter().zip(p) {
+                out[i] = s;
+            }
         }
         Ok(out)
     }

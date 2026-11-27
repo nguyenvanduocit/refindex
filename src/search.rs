@@ -23,8 +23,9 @@ const POOL: usize = 300;
 const GRAPH_TOP: usize = 60;
 const MAX_DEFS_FOR_EDGE: i64 = 40;
 const BETA: f64 = 0.3;
-const RERANK_N: usize = 50;
+const RERANK_N: usize = 32;
 const RERANK_WEIGHT: f64 = 2.0;
+const RERANK_K: f64 = 10.0;
 const STOP: &str = "a an the of to in on for and or is are be how what where why when which does \
     do with by from at as it its into this that these those there their via using use";
 
@@ -463,8 +464,8 @@ impl Engine {
     }
 
     /// The cross-encoder reads (query, chunk) for the top RERANK_N fused candidates. Its order
-    /// is added as a list worth RERANK_WEIGHT ordinary ones, so it dominates the top while the
-    /// graph and project steps after it still move hits.
+    /// is added as a steep list weighted by relevance, so it decides the top while the graph
+    /// and project steps after it still move hits.
     fn cross_rerank(&mut self, query: &str, fused: &mut HashMap<i64, f64>, why: &mut HashMap<i64, Why>) -> Result<()> {
         let mut top: Vec<i64> = fused.keys().copied().collect();
         top.sort_by(|a, b| fused[b].total_cmp(&fused[a]));
@@ -490,7 +491,10 @@ impl Engine {
         let mut order: Vec<(f32, i64)> = hits.iter().map(|h| (scores[idx[&h.hash]], h.id)).collect();
         order.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (rank, (s, id)) in order.into_iter().enumerate() {
-            *fused.get_mut(&id).unwrap() += RERANK_WEIGHT / (RRF_K + rank as f64 + 1.0);
+            // A steep list (k = RERANK_K, not RRF_K) scaled by the relevance itself: the
+            // cross-encoder's confident top beats a chunk that merely sits in both retrieval
+            // lists, and a list of uniformly poor scores leaves the fused order alone.
+            *fused.get_mut(&id).unwrap() += RERANK_WEIGHT * s as f64 / (RERANK_K + rank as f64 + 1.0);
             let w = why.entry(id).or_default();
             w.rerank = Some(rank + 1);
             w.relevance = Some(s);
@@ -502,13 +506,18 @@ impl Engine {
     fn rerank_text(&self, h: &Hit) -> String {
         let p = config::source_root(&h.repo).join(&h.path);
         let src = std::fs::read(&p).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+        // Indentation costs tokens and tells the cross-encoder nothing; the model reads
+        // MAX_TOKENS, so ~1000 characters of code is all it sees anyway.
         let mut body = String::new();
         for l in src.split('\n').skip(h.start.saturating_sub(1)).take(h.end + 1 - h.start) {
-            if body.len() > 1500 {
+            if body.len() > 1000 {
                 break;
             }
-            body.push_str(l);
-            body.push('\n');
+            let l = l.trim();
+            if !l.is_empty() {
+                body.push_str(l);
+                body.push('\n');
+            }
         }
         format!("{}\n{} {}\n{}", config::cite_path(&h.repo, &h.path), h.kind.trim_end_matches('+'), h.name, body)
     }

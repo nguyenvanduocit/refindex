@@ -102,6 +102,13 @@ pub struct Chunk {
     pub name: String,
     pub qualname: String,
     pub defines: Vec<String>,
+    /// Line of the signature (or heading) of the definition a continuation piece belongs to;
+    /// 0 when the chunk starts with it. Its embedding text repeats that line.
+    pub sig: usize,
+    /// Names the chunk's code uses, read from the syntax tree (identifier leaves outside
+    /// comments and strings, minus the names it defines). `None` without a grammar: the
+    /// indexer falls back to every identifier-shaped word.
+    pub refs: Option<Vec<String>>,
 }
 
 impl Chunk {
@@ -113,6 +120,8 @@ impl Chunk {
             name: name.into(),
             qualname: qual.into(),
             defines: vec![],
+            sig: 0,
+            refs: None,
         }
     }
 }
@@ -329,6 +338,8 @@ struct Chunker<'a> {
     src: &'a [u8],
     out: Vec<Chunk>,
     pending: Vec<(usize, usize)>,
+    /// Names declared by the one-line declarations in `pending`.
+    pending_defs: Vec<String>,
     comments: Option<(usize, usize)>,
 }
 
@@ -338,7 +349,9 @@ impl Chunker<'_> {
             self.pending.push(c);
         }
         if let (Some(f), Some(l)) = (self.pending.first(), self.pending.last()) {
-            self.out.push(Chunk::new(f.0, l.1, "items", scope, scope));
+            let mut c = Chunk::new(f.0, l.1, "items", scope, scope);
+            c.defines = std::mem::take(&mut self.pending_defs);
+            self.out.push(c);
         }
         self.pending.clear();
     }
@@ -392,9 +405,58 @@ impl Chunker<'_> {
                 }
             }
         }
+        let sig = node.start_position().row + 1;
+        if e + 1 - s > MAX_CHUNK_LINES
+            && let Some(b) = body(node)
+            && self.split_at_statements(b, s, e, sig, kind, &name, &qual, &defines)
+        {
+            return;
+        }
         let mut c = Chunk::new(s, e, kind, &name, &qual);
         c.defines = defines;
         self.out.push(c);
+    }
+
+    /// A long function is cut between its body's statements rather than at fixed lines, so
+    /// no piece starts or ends inside an expression. Each piece keeps the name and the line of
+    /// the signature (`sig`), which the embedding text repeats. A statement longer than a
+    /// window is left to `split_long`.
+    #[allow(clippy::too_many_arguments)]
+    fn split_at_statements(&mut self, b: Node, s: usize, e: usize, sig: usize, kind: &str,
+                           name: &str, qual: &str, defines: &[String]) -> bool {
+        let mut cur = b.walk();
+        let ends: Vec<usize> = b.named_children(&mut cur).map(|k| lines(k).1).collect();
+        if ends.len() < 2 {
+            return false;
+        }
+        // Pieces are contiguous: each runs from the line after the previous piece to the end
+        // of its last statement; the first holds the doc comment and signature, the last the
+        // closing lines.
+        let mut pieces: Vec<(usize, usize)> = vec![];
+        let mut ps = s;
+        let mut pe = lines(b).0.max(s);
+        for ke in ends {
+            if ke + 1 - ps > WINDOW_LINES && pe > ps {
+                pieces.push((ps, pe));
+                ps = pe + 1;
+            }
+            pe = pe.max(ke);
+        }
+        pieces.push((ps, e.max(pe)));
+        if pieces.len() < 2 {
+            return false;
+        }
+        for (i, (ps, pe)) in pieces.into_iter().enumerate() {
+            let mut c = Chunk::new(ps, pe, kind, name, qual);
+            c.sig = sig;
+            if i == 0 {
+                c.defines = defines.to_vec();
+            } else {
+                c.kind.push('+');
+            }
+            self.out.push(c);
+        }
+        true
     }
 
     fn walk(&mut self, node: Node, scope: &str) {
@@ -444,6 +506,17 @@ impl Chunker<'_> {
                 continue;
             }
             if DEF_TYPES.contains(&t) {
+                if e + 1 - s <= 2 && body(c).is_none() {
+                    // `mod x;`, `struct Unit;`, forward declarations, prototypes: alone they
+                    // are a chunk with nothing to read. They join the neighbouring items and
+                    // keep their names, so `def` still finds them.
+                    let n = simple_name(&find_name(self.src, Some(c), 0));
+                    if !n.is_empty() {
+                        self.pending_defs.push(n);
+                    }
+                    self.loose(s, e, scope);
+                    continue;
+                }
                 self.emit_def(c, scope, None, None);
                 continue;
             }
@@ -472,10 +545,16 @@ fn split_long(chunks: Vec<Chunk>) -> Vec<Chunk> {
         loop {
             let e = c.end.min(s + WINDOW_LINES - 1);
             let mut w = Chunk::new(s, e, &c.kind, &c.name, &c.qualname);
+            w.sig = c.sig;
             if first {
                 w.defines = c.defines.clone();
             } else {
-                w.kind.push('+');
+                if w.sig == 0 {
+                    w.sig = c.start;
+                }
+                if !w.kind.ends_with('+') {
+                    w.kind.push('+');
+                }
             }
             out.push(w);
             first = false;
@@ -532,7 +611,7 @@ pub fn chunk_file(src: &[u8], lang: &str) -> Vec<Chunk> {
         p.parse(src, None)
     });
     let Some(tree) = tree else { return whole() };
-    let mut ch = Chunker { src, out: vec![], pending: vec![], comments: None };
+    let mut ch = Chunker { src, out: vec![], pending: vec![], pending_defs: vec![], comments: None };
     ch.walk(tree.root_node(), "");
     ch.flush("");
     let mut out = ch.out;
@@ -540,7 +619,48 @@ pub fn chunk_file(src: &[u8], lang: &str) -> Vec<Chunk> {
     if out.is_empty() {
         return whole();
     }
-    split_long(out)
+    let mut out = split_long(out);
+    let uses = used_names(src, tree.root_node());
+    for c in &mut out {
+        let a = uses.partition_point(|u| u.0 < c.start);
+        let b = uses.partition_point(|u| u.0 <= c.end);
+        let mut names: Vec<String> = uses[a..b].iter()
+            .filter(|u| !c.defines.contains(&u.1))
+            .map(|u| u.1.clone())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        c.refs = Some(names);
+    }
+    out
+}
+
+/// Identifier leaves of the tree in document order, as (1-based line, name), outside
+/// comments and string literals: the names code really uses, not the words of its prose.
+fn used_names(src: &[u8], root: Node) -> Vec<(usize, String)> {
+    let skip = |k: &str| k.contains("comment") || k.contains("string") || k.contains("char_literal");
+    let mut out = vec![];
+    let mut cur = root.walk();
+    'walk: loop {
+        let n = cur.node();
+        let k = n.kind();
+        let descend = !skip(k);
+        if descend && n.child_count() == 0 && n.is_named() && (k.ends_with("identifier") || k == "constant") {
+            let t = text(src, n);
+            if t.len() >= 3 && IDENT.find(t).is_some_and(|m| m.len() == t.len()) && !KW.contains(t) {
+                out.push((n.start_position().row + 1, t.to_string()));
+            }
+        }
+        if descend && cur.goto_first_child() {
+            continue;
+        }
+        while !cur.goto_next_sibling() {
+            if !cur.goto_parent() {
+                break 'walk;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -557,6 +677,49 @@ mod tests {
         let i = c.iter().find(|c| c.kind == "impl_item").unwrap();
         assert_eq!(i.name, "Foo for Bar");
         assert_eq!(i.defines, vec!["Bar"]);
+    }
+
+    #[test]
+    fn one_line_declarations_join_items_and_keep_names() {
+        let src = b"mod flex_align_items;\nmod grid;\nstruct Unit;\n\nfn real() {\n  x();\n}\n";
+        let c = chunk_file(src, "rust");
+        assert!(!c.iter().any(|c| c.kind == "mod_item"), "{c:?}");
+        let items = c.iter().find(|c| c.kind == "items").unwrap();
+        assert_eq!((items.start, items.end), (1, 3));
+        assert_eq!(items.defines, vec!["flex_align_items", "grid", "Unit"]);
+        assert!(c.iter().any(|c| c.name == "real"));
+    }
+
+    #[test]
+    fn long_functions_split_between_statements() {
+        let mut s = String::from("/// Doc.\nfn long_one() {\n");
+        for i in 0..60 {
+            s.push_str(&format!("    if a{i} {{\n        b{i}();\n    }}\n"));
+        }
+        s.push_str("}\n");
+        let c = chunk_file(s.as_bytes(), "rust");
+        assert!(c.len() >= 2, "{c:?}");
+        assert_eq!(c[0].start, 1);
+        assert_eq!(c[0].defines, vec!["long_one"]);
+        for (a, b) in c.iter().zip(c.iter().skip(1)) {
+            assert_eq!(b.start, a.end + 1, "pieces are contiguous: {c:?}");
+            assert_eq!(b.kind, "function_item+");
+            assert_eq!(b.sig, 2, "continuations point at the signature");
+            assert_eq!((b.start - 3) % 3, 0, "a piece starts at a statement: {b:?}");
+        }
+        assert_eq!(c.last().unwrap().end, 3 + 60 * 3);
+    }
+
+    #[test]
+    fn refs_come_from_code_not_prose() {
+        let src = b"/// Calls helper_in_doc.\nfn user() {\n  // comment_name\n  let s = \"string_name\";\n  callee(LayoutBox::new());\n}\n";
+        let c = chunk_file(src, "rust");
+        let u = c.iter().find(|c| c.name == "user").unwrap();
+        let r = u.refs.as_ref().unwrap();
+        assert!(r.contains(&"callee".to_string()) && r.contains(&"LayoutBox".to_string()), "{r:?}");
+        for absent in ["helper_in_doc", "comment_name", "string_name", "user"] {
+            assert!(!r.contains(&absent.to_string()), "{absent} in {r:?}");
+        }
     }
 
     #[test]

@@ -12,15 +12,24 @@ fuses their rankings:
 Chunks are definitions (functions, types, impls, classes, with their doc comment) cut by
 tree-sitter for Rust, C, C++, Objective-C, Kotlin, Java, TypeScript/TSX, JavaScript, Python,
 Go, Swift and Zig; heading sections for Markdown/AsciiDoc/RST; line windows for code without a
-grammar here (shaders, IDL, Dart, C#, QML, Slint, CSS...).
+grammar here (shaders, IDL, Dart, C#, QML, Slint, CSS...). The syntax tree also decides:
+
+- where a long function is cut: between the statements of its body, never inside one; each
+  continuation piece repeats the signature line in its embedding text;
+- what is not a chunk of its own: body-less one-line declarations (`mod x;`, `struct Unit;`,
+  forward declarations, prototypes) join the neighbouring items and keep their names for `def`;
+- the graph edges: a chunk uses the identifier leaves of its code, not words in its comments
+  or strings (files without a grammar fall back to identifier-shaped words).
 
 Sources: every repo checked out under the peers directory (`references/` by default), plus the
 project's own document trees listed in `own` (indexed as `@docs`, `@notes`, ...).
 
 Ranking: reciprocal-rank fusion of BM25 and vector lists; a cross-encoder
 (`granite-embedding-reranker-english-r2`, ModernBERT, our own SiLU head on candle's backbone)
-reads (query, chunk) for the fused top 50 and its order is added as a list worth two
-(`rr#n(relevance)` in the output; `--no-rerank` or MCP `rerank=false` to skip); then one step of
+reads (query, chunk) for the fused top 32 and adds its order as a steep list (k = 10, not 60)
+scaled by its relevance, so its confident top decides the head while poor scores leave the
+fused order alone (`rr#n(relevance)` in the output; `--no-rerank` or MCP `rerank=false` to
+skip; about 2 s on Metal, plus a one-off 2 s model load in the CLI); then one step of
 personalised PageRank over the hit subgraph. Every hit spreads its score over the definitions it uses,
 weighted by how specific each name is (few definitions, few users). A definition that two or
 more hits use but neither list found is pulled in from the users' repos.
@@ -50,7 +59,9 @@ config file the project root is the current directory and only `references/` is 
 | `[concepts.<name>]` | `terms`: project vocabulary <-> the names peers use (BM25 expansion) |
 
 `REFX_CONFIG`, `REFX_HOME` and `REFX_REFS` override the file. Areas and concepts take effect
-without a reindex.
+without a reindex. `REFX_DEVICE=cpu` keeps the models off Metal; `REFX_TIMING=1` prints
+rerank batch times. An index built by an older chunker (`graph.db` format) is refused with a
+note to rebuild it; `vectors.bin` is keyed by text and reused.
 
 ## Use
 
@@ -99,7 +110,8 @@ refx concepts invalidation   # what BM25 also searches for this word
 - Concept expansion (BM25 only): `[concepts]` maps project vocabulary to the names peers use
   (invalidation -> markNeedsLayout, SetNeedsLayout, queue_resize...), plus links learned at
   index time from citations: the words around `references/<repo>/<path>:a-b` in the docs
-  paired with the symbols the cited peer chunk defines. Search prints `expanded: ...`.
+  paired with the symbols the cited peer chunk defines. A link needs two citations that agree,
+  and words around a tenth of all citations teach nothing. Search prints `expanded: ...`.
 - Ranking after RRF and the symbol-graph step: peer code the docs cite (`+cited`) and code
   tied to a peer bug the docs mention (`+known-bug`) move up; sections of superseded ADRs
   (`-superseded`) move down so the decision in force ranks first.

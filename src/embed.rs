@@ -58,7 +58,7 @@ impl Embedder {
     }
 
     pub fn load_from(dir: &Path) -> Result<Self> {
-        let device = Device::new_metal(0).unwrap_or(Device::Cpu);
+        let device = device();
         let cfg: Config = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
         let mut tok = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("{e}"))?;
         tok.with_truncation(Some(TruncationParams { max_length: EMBED_TOKENS, ..Default::default() }))
@@ -97,6 +97,14 @@ impl Embedder {
         let cls = cls.broadcast_div(&norm)?;
         Ok(cls.to_vec2::<f32>()?)
     }
+}
+
+/// Metal when present; `REFX_DEVICE=cpu` forces the CPU.
+pub fn device() -> Device {
+    if std::env::var("REFX_DEVICE").is_ok_and(|d| d == "cpu") {
+        return Device::Cpu;
+    }
+    Device::new_metal(0).unwrap_or(Device::Cpu)
 }
 
 /// Load safetensors by reading them into memory (no mmap, which candle exposes as `unsafe`).
