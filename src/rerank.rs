@@ -9,9 +9,11 @@
 //! (no bias) -> linear -> sigmoid.
 
 use anyhow::{Result, anyhow};
-use candle_core::{DType, Device, IndexOp, Module, Tensor};
+use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{LayerNorm, Linear, VarBuilder};
-use candle_transformers::models::modernbert::{Config, ModernBert};
+use candle_transformers::models::modernbert::Config;
+
+use crate::modernbert::ModernBert;
 use tokenizers::{EncodeInput, PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
 use crate::embed;
@@ -50,11 +52,16 @@ impl Reranker {
             ..Default::default()
         }));
         let vb: VarBuilder = embed::load_weights(&dir, &device)?;
-        let model = ModernBert::load(vb.clone(), &cfg)?;
+        let model = ModernBert::load(&vb.pp("model"), &cfg)?;
+        // The head is tiny and reads the F32 CLS state: keep it in F32.
         let h = cfg.hidden_size;
-        let dense = Linear::new(vb.get((h, h), "head.dense.weight")?, None);
-        let norm = LayerNorm::new_no_bias(vb.get(h, "head.norm.weight")?, cfg.layer_norm_eps);
-        let classifier = Linear::new(vb.get((1, h), "classifier.weight")?, vb.get(1, "classifier.bias").ok());
+        let f32 = |t: Tensor| t.to_dtype(DType::F32);
+        let dense = Linear::new(f32(vb.get((h, h), "head.dense.weight")?)?, None);
+        let norm = LayerNorm::new_no_bias(f32(vb.get(h, "head.norm.weight")?)?, cfg.layer_norm_eps);
+        let classifier = Linear::new(
+            f32(vb.get((1, h), "classifier.weight")?)?,
+            vb.get(1, "classifier.bias").ok().map(f32).transpose()?,
+        );
         Ok(Reranker { model, dense, norm, classifier, silu: act == "silu", tok, device })
     }
 
@@ -75,13 +82,8 @@ impl Reranker {
             let t = std::time::Instant::now();
             let enc = self.tok.encode_batch(pairs, true).map_err(|e| anyhow!("{e}"))?;
             let (b, n) = (enc.len(), enc[0].get_ids().len());
-            let ids: Vec<u32> = enc.iter().flat_map(|e| e.get_ids().iter().copied()).collect();
-            let mask: Vec<f32> =
-                enc.iter().flat_map(|e| e.get_attention_mask().iter().map(|&m| m as f32)).collect();
-            let ids = Tensor::from_vec(ids, (b, n), &self.device)?;
-            let mask = Tensor::from_vec(mask, (b, n), &self.device)?;
-            let hidden = self.model.forward(&ids, &mask)?;
-            let cls = hidden.i((.., 0, ..))?.contiguous()?;
+            let (ids, lens) = embed::batch_ids(&enc, &self.device)?;
+            let cls = self.model.forward_cls(&ids, &lens)?; // (b, d) F32
             let x = self.dense.forward(&cls)?;
             let x = if self.silu { candle_nn::ops::silu(&x)? } else { x.gelu_erf()? };
             let logits = self.classifier.forward(&self.norm.forward(&x)?)?; // (b, 1)

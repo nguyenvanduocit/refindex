@@ -9,6 +9,7 @@ mod embed;
 mod fts;
 mod indexer;
 mod mcp;
+mod modernbert;
 mod paths;
 mod project;
 mod rerank;
@@ -86,8 +87,12 @@ enum Cmd {
     Embed {
         #[arg(long)]
         limit: Option<usize>,
-        #[arg(long, default_value_t = 64)]
+        /// Padded tokens per batch (longest x rows)
+        #[arg(long, default_value_t = 4096)]
         batch: usize,
+        /// Devices that embed side by side from one queue: metal, cpu (comma-separated)
+        #[arg(long, value_delimiter = ',', default_value = "metal,cpu")]
+        devices: Vec<String>,
     },
     /// Hybrid search
     #[command(alias = "s")]
@@ -202,10 +207,12 @@ fn main() -> Result<()> {
     let paths = paths::Paths::new();
     match cli.cmd {
         Cmd::Index { repos } => return indexer::index(&paths, &repos),
-        Cmd::Embed { limit, batch } => return indexer::embed(&paths, limit, batch),
+        Cmd::Embed { limit, batch, devices } => return indexer::embed(&paths, limit, batch, &devices),
         Cmd::Mcp => return mcp::serve(),
         Cmd::Vectors { texts } => {
-            let v = embed::Embedder::load()?.encode(&texts)?;
+            // The indexing path (`encode_budget`), so the referee checks what `embed` stores;
+            // a small budget makes the referee's texts span several batches.
+            let v = embed::Embedder::load()?.encode_budget(&texts, 512)?;
             println!("{}", serde_json::to_string(&v)?);
             return Ok(());
         }

@@ -446,55 +446,136 @@ fn learn_concepts(db: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Embed every distinct chunk text that has no vector yet, shortest first (least padding).
-pub fn embed(paths: &Paths, limit: Option<usize>, batch: usize) -> Result<()> {
+/// Rows a worker takes from the queue at a time (flushed together).
+const GROUP_ROWS: usize = 1024;
+
+type EmbedRow =(Vec<u8>, String, String, usize, usize, String, String, usize);
+
+/// Embed every distinct chunk text that has no vector yet.
+///
+/// Order is by priority, then shortest first within it (least padding): the project's own
+/// docs, then peer files those docs cite, then files in a work area of the config, then the
+/// rest. Search by meaning is useful long before the whole index is embedded.
+///
+/// Each device in `devices` (`metal`, `cpu`) runs its own model on its own thread and takes
+/// the next batch from one shared queue, so a fast device simply takes more batches. One
+/// appender writes the vectors, flushed per batch, so the run can stop at any time.
+pub fn embed(paths: &Paths, limit: Option<usize>, batch: usize, devices: &[String]) -> Result<()> {
     let db = store::open(&paths.db, false)?;
-    let model = Embedder::load()?;
     let have = vecs::Vectors::load(&paths.vecs)?.map(|v| v.hashes()).unwrap_or_default();
-    type Row = (Vec<u8>, String, String, usize, usize, String, String, usize);
-    let mut rows: Vec<Row> = db
-        .prepare(
-            "SELECT c.hash, r.name, f.path, c.start, c.end, c.kind, c.qualname, c.sig
-             FROM chunks c JOIN files f ON f.id=c.file_id JOIN repos r ON r.id=f.repo_id
-             GROUP BY c.hash ORDER BY c.end - c.start",
-        )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))?
+    let globs: Vec<String> = config::areas()?.into_values()
+        .flat_map(|a| a.globs).map(|g| g.to_lowercase()).collect();
+    let in_area = if globs.is_empty() {
+        "0".to_string()
+    } else {
+        vec!["lower(r.name||'/'||f.path) GLOB ?"; globs.len()].join(" OR ")
+    };
+    // The tier is a property of the file, computed once per file. Chunks are then read in one
+    // sequential scan; grouping by text and sorting happen here, in memory: SQLite's GROUP BY
+    // and ORDER BY over 1.5M rows spill to temp files and took minutes.
+    let sql = format!(
+        "SELECT f.id, r.name, f.path,
+                CASE WHEN r.name LIKE '@%' THEN 0
+                     WHEN EXISTS(SELECT 1 FROM cites ct WHERE ct.repo=r.name AND ct.path=f.path) THEN 1
+                     WHEN {in_area} THEN 2 ELSE 3 END
+         FROM files f JOIN repos r ON r.id=f.repo_id");
+    let files: HashMap<i64, (String, String, usize)> = db.prepare(&sql)?
+        .query_map(rusqlite::params_from_iter(globs.iter()), |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
         .collect::<rusqlite::Result<_>>()?;
-    rows.retain(|r| r.0.len() == 16 && !have.contains(&<Hash>::try_from(&r.0[..]).unwrap()));
+    // Best (lowest) tier per distinct text, then that chunk's row.
+    let mut best: HashMap<Hash, (usize, EmbedRow)> = HashMap::new();
+    let mut st = db.prepare("SELECT file_id, hash, start, end, kind, qualname, sig FROM chunks")?;
+    let mut q = st.query([])?;
+    while let Some(r) = q.next()? {
+        let hash: Vec<u8> = r.get(1)?;
+        let Ok(h) = <Hash>::try_from(&hash[..]) else { continue };
+        if have.contains(&h) {
+            continue;
+        }
+        let Some((repo, path, tier)) = files.get(&r.get::<_, i64>(0)?) else { continue };
+        if best.get(&h).is_some_and(|b| b.0 <= *tier) {
+            continue;
+        }
+        let row: EmbedRow = (hash, repo.clone(), path.clone(), r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?);
+        best.insert(h, (*tier, row));
+    }
+    drop(q);
+    drop(st);
+    drop(db);
+    let mut tiers = [0usize; 4];
+    let mut rows: Vec<(usize, EmbedRow)> = best.into_values().inspect(|(t, _)| tiers[(*t).min(3)] += 1).collect();
+    rows.sort_by_key(|(t, r)| (*t, r.4 - r.3));
+    let mut rows: Vec<EmbedRow> = rows.into_iter().map(|(_, r)| r).collect();
     if let Some(l) = limit {
         rows.truncate(l);
     }
     let total = rows.len();
-    eprintln!("{total} chunks to embed on {} ({} already)", model.device_name(), have.len());
-    let mut out = Appender::open(&paths.vecs, model.dim)?;
-    let mut files: HashMap<(String, String), String> = HashMap::new();
-    let t0 = Instant::now();
-    let mut done = 0;
-    for part in rows.chunks(batch) {
-        let mut texts = Vec::with_capacity(part.len());
-        for (_, repo, path, s, e, kind, qual, sig) in part {
-            if files.len() > 4000 {
-                files.clear();
-            }
-            let src = files
-                .entry((repo.clone(), path.clone()))
-                .or_insert_with(|| std::fs::read(config::source_root(repo).join(path))
-                    .map(|b| String::from_utf8_lossy(&b).into_owned())
-                    .unwrap_or_default());
-            let lines: Vec<&str> = src.split('\n').collect();
-            let c = Chunk { start: *s, end: *e, kind: kind.clone(), name: qual.clone(),
-                            qualname: qual.clone(), defines: vec![], sig: *sig, refs: None };
-            texts.push(embed_text(repo, path, &c, &lines));
-        }
-        let v = model.encode(&texts)?;
-        for ((h, ..), v) in part.iter().zip(&v) {
-            out.push(&h[..].try_into()?, v)?;
-        }
-        out.flush()?;
-        done += part.len();
-        let rate = done as f64 / t0.elapsed().as_secs_f64();
-        eprint!("\r{done}/{total}  {rate:.0}/s  eta {:.0} min   ", (total - done) as f64 / rate / 60.0);
+    eprintln!("{total} chunks to embed ({} already): own docs {}, cited {}, work areas {}, rest {}; on {}",
+        have.len(), tiers[0], tiers[1], tiers[2], tiers[3], devices.join("+"));
+    let dir = crate::embed::model_dir()?;
+    let mut models = vec![];
+    for d in devices {
+        let device = match d.as_str() {
+            "cpu" => candle_core::Device::Cpu,
+            "metal" => candle_core::Device::new_metal(0)?,
+            other => anyhow::bail!("unknown device {other}; use metal or cpu"),
+        };
+        models.push((d.clone(), Embedder::load_on(&dir, device)?));
     }
-    eprintln!();
+    let dim = models.first().map(|m| m.1.dim).ok_or_else(|| anyhow::anyhow!("no device"))?;
+    let out = std::sync::Mutex::new(Appender::open(&paths.vecs, dim)?);
+    // A worker takes a group of rows, tokenizes it once and cuts it into batches of about
+    // `batch` padded tokens by real token count (`Embedder::encode_budget`). Line counts
+    // (the queue's order) predict tokens badly: one long-line chunk padded whole batches.
+    let parts: Vec<&[EmbedRow]> = rows.chunks(GROUP_ROWS).collect();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let t0 = Instant::now();
+    std::thread::scope(|s| -> Result<()> {
+        let workers: Vec<_> = models.into_iter().map(|(name, model)| {
+            let (out, parts, next, done) = (&out, &parts, &next, &done);
+            s.spawn(move || -> Result<usize> {
+                let mut files: HashMap<(String, String), String> = HashMap::new();
+                let mut mine = 0;
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(part) = parts.get(i) else { return Ok(mine) };
+                    let texts: Vec<String> = part.iter().map(|(_, repo, path, s, e, kind, qual, sig)| {
+                        if files.len() > 4000 {
+                            files.clear();
+                        }
+                        let src = files.entry((repo.clone(), path.clone())).or_insert_with(|| {
+                            std::fs::read(config::source_root(repo).join(path))
+                                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                                .unwrap_or_default()
+                        });
+                        let lines: Vec<&str> = src.split('\n').collect();
+                        let c = Chunk { start: *s, end: *e, kind: kind.clone(), name: qual.clone(),
+                                        qualname: qual.clone(), defines: vec![], sig: *sig, refs: None };
+                        embed_text(repo, path, &c, &lines)
+                    }).collect();
+                    let v = model.encode_budget(&texts, batch)
+                        .map_err(|e| e.context(format!("embedding on {name}")))?;
+                    {
+                        let mut out = out.lock().unwrap();
+                        for ((h, ..), v) in part.iter().zip(&v) {
+                            out.push(&h[..].try_into()?, v)?;
+                        }
+                        out.flush()?;
+                    }
+                    mine += part.len();
+                    let n = done.fetch_add(part.len(), std::sync::atomic::Ordering::Relaxed) + part.len();
+                    let rate = n as f64 / t0.elapsed().as_secs_f64();
+                    eprint!("\r{n}/{total}  {rate:.0}/s  eta {:.0} min   ", (total - n) as f64 / rate / 60.0);
+                }
+            })
+        }).collect();
+        let names: Vec<String> = devices.to_vec();
+        for (w, name) in workers.into_iter().zip(names) {
+            let mine = w.join().map_err(|_| anyhow::anyhow!("{name} worker panicked"))??;
+            eprintln!("\n{name}: {mine} chunks");
+        }
+        Ok(())
+    })?;
     Ok(())
 }

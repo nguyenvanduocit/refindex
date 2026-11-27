@@ -128,6 +128,17 @@ set `REFX_CONFIG`:
 The embedding model `ibm-granite/granite-embedding-small-english-r2` (ModernBERT, 384 dims,
 CLS pooling) is read from the Hugging Face cache or downloaded into the index home.
 
+Both models run on our own ModernBERT encoder (`src/modernbert.rs`), about 3x faster than
+candle's on Metal with the same output (cosine 1.00000, rerank scores within 1e-4):
+F16 on Metal, one fused `sdpa` kernel per layer, masks built once per batch and broadcast over
+heads, and only the work the CLS token depends on (trailing sliding-window layers run on a
+prefix of the sequence).
+
+`refx embed` orders work by priority (own docs, peer files the docs cite, work areas, the
+rest), so search by meaning is useful long before the index is complete. Metal and the CPU
+embed side by side from one queue (`--devices metal,cpu`); each takes groups of rows,
+tokenizes them once and cuts batches of about `--batch` padded tokens by real token count.
+
 ## Checks
 
 - `cargo test`: chunker contracts (doc comments attach, large containers split into members,
