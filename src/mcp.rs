@@ -323,6 +323,12 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:7311";
 /// prints the project's MCP URL. Meant for a session-start hook: quick when the daemon runs,
 /// and the daemon it starts inherits the caller's file access (no launchd or privacy grants).
 pub fn up(addr: &str) -> Result<()> {
+    println!("{}", ensure_daemon(addr)?);
+    Ok(())
+}
+
+/// `up` without printing: the project's MCP URL, the daemon running.
+pub fn ensure_daemon(addr: &str) -> Result<String> {
     use std::net::{SocketAddr, TcpStream};
     use std::os::unix::process::CommandExt;
     use std::time::{Duration, Instant};
@@ -356,8 +362,7 @@ pub fn up(addr: &str) -> Result<()> {
         }
         eprintln!("refx: daemon started at {addr} (log {})", log_path.display());
     }
-    println!("http://{addr}/mcp/{name}");
-    Ok(())
+    Ok(format!("http://{addr}/mcp/{name}"))
 }
 
 type HttpService = rmcp::transport::StreamableHttpService<

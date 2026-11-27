@@ -11,6 +11,7 @@ mod indexer;
 mod mcp;
 mod modernbert;
 mod paths;
+mod proxy;
 mod project;
 mod rerank;
 mod search;
@@ -170,6 +171,12 @@ enum Cmd {
         #[arg(long, default_value = mcp::DEFAULT_ADDR)]
         addr: String,
     },
+    /// Stdio MCP server that forwards to the daemon (starting it if needed): for clients that
+    /// launch a command, with the daemon's warm engine
+    Connect {
+        #[arg(long, default_value = mcp::DEFAULT_ADDR)]
+        addr: String,
+    },
     /// Print embeddings of texts as JSON (for the embedding referee)
     #[command(hide = true)]
     Vectors { texts: Vec<String> },
@@ -222,6 +229,7 @@ fn main() -> Result<()> {
         Cmd::Mcp => return mcp::serve(),
         Cmd::Serve { addr } => return mcp::serve_http(&addr),
         Cmd::Up { addr } => return mcp::up(&addr),
+        Cmd::Connect { addr } => return proxy::connect(&addr),
         Cmd::Vectors { texts } => {
             // The indexing path (`encode_budget`), so the referee checks what `embed` stores;
             // a small budget makes the referee's texts span several batches.
@@ -325,7 +333,8 @@ fn main() -> Result<()> {
                 println!("{n:28} {:14} {c}", &h[..h.len().min(12)]);
             }
         }
-        Cmd::Index { .. } | Cmd::Embed { .. } | Cmd::Mcp | Cmd::Serve { .. } | Cmd::Up { .. } | Cmd::Vectors { .. }
+        Cmd::Index { .. } | Cmd::Embed { .. } | Cmd::Mcp | Cmd::Serve { .. } | Cmd::Up { .. } | Cmd::Connect { .. }
+        | Cmd::Vectors { .. }
         | Cmd::Scores { .. } => unreachable!(),
     }
     Ok(())
