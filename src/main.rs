@@ -157,8 +157,19 @@ enum Cmd {
     Bug { bug: String },
     Stats,
     Repos,
-    /// Serve the index over MCP (stdio)
+    /// Serve the index over MCP (stdio), one process per client
     Mcp,
+    /// Serve every registered project over MCP on HTTP (`http://<addr>/mcp/<project>`): one
+    /// warm process for all projects and sessions
+    Serve {
+        #[arg(long, default_value = mcp::DEFAULT_ADDR)]
+        addr: String,
+    },
+    /// Register this project with the daemon, start the daemon if needed, print the MCP URL
+    Up {
+        #[arg(long, default_value = mcp::DEFAULT_ADDR)]
+        addr: String,
+    },
     /// Print embeddings of texts as JSON (for the embedding referee)
     #[command(hide = true)]
     Vectors { texts: Vec<String> },
@@ -209,6 +220,8 @@ fn main() -> Result<()> {
         Cmd::Index { repos } => return indexer::index(&paths, &repos),
         Cmd::Embed { limit, batch, devices } => return indexer::embed(&paths, limit, batch, &devices),
         Cmd::Mcp => return mcp::serve(),
+        Cmd::Serve { addr } => return mcp::serve_http(&addr),
+        Cmd::Up { addr } => return mcp::up(&addr),
         Cmd::Vectors { texts } => {
             // The indexing path (`encode_budget`), so the referee checks what `embed` stores;
             // a small budget makes the referee's texts span several batches.
@@ -312,7 +325,8 @@ fn main() -> Result<()> {
                 println!("{n:28} {:14} {c}", &h[..h.len().min(12)]);
             }
         }
-        Cmd::Index { .. } | Cmd::Embed { .. } | Cmd::Mcp | Cmd::Vectors { .. } | Cmd::Scores { .. } => unreachable!(),
+        Cmd::Index { .. } | Cmd::Embed { .. } | Cmd::Mcp | Cmd::Serve { .. } | Cmd::Up { .. } | Cmd::Vectors { .. }
+        | Cmd::Scores { .. } => unreachable!(),
     }
     Ok(())
 }

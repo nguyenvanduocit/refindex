@@ -5,9 +5,10 @@
 //! Without a config file the project root is the current directory and only `references/` is
 //! indexed. `REFX_HOME` and `REFX_REFS` override `home` and `peers`.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 pub const MODEL: &str = "ibm-granite/granite-embedding-small-english-r2";
 pub const MODEL_FILES: &[&str] = &["config.json", "tokenizer.json", "model.safetensors"];
@@ -36,6 +37,9 @@ pub const CONFIG_FILE: &str = "refx.toml";
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
+    /// Name of the project in the daemon's registry and URL (`/mcp/<name>`). Default: the
+    /// directory name.
+    pub name: Option<String>,
     /// Directory holding one checkout per peer repo. Default `references`.
     pub peers: Option<String>,
     /// Index home: sqlite graph db, tantivy dir, vectors file, model cache. Default `.refx`.
@@ -67,48 +71,131 @@ pub struct Entities {
     pub ledger: Option<String>,
 }
 
-struct Loaded {
-    root: PathBuf,
-    cfg: Config,
+/// A project: its root (the directory of `refx.toml`) and its config.
+#[derive(Debug)]
+pub struct Project {
+    pub root: PathBuf,
+    pub cfg: Config,
 }
 
-static LOADED: LazyLock<Loaded> = LazyLock::new(|| match load() {
-    Ok(l) => l,
-    Err(e) => {
-        eprintln!("refx: {e:#}");
-        std::process::exit(2);
+impl Project {
+    /// The project of a `refx.toml` file.
+    pub fn load(file: &Path) -> anyhow::Result<Arc<Project>> {
+        use anyhow::Context;
+        let file = std::path::absolute(file)?;
+        let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+        let cfg = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
+        Ok(Arc::new(Project { root: file.parent().unwrap_or(Path::new(".")).to_path_buf(), cfg }))
     }
-});
 
-fn load() -> anyhow::Result<Loaded> {
-    use anyhow::Context;
-    let file = match std::env::var_os("REFX_CONFIG") {
+    /// The project's name: `name` in its config, else its directory's name.
+    pub fn name(&self) -> String {
+        self.cfg.name.clone().unwrap_or_else(|| {
+            self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into())
+        })
+    }
+}
+
+/// `$REFX_CONFIG`, or `refx.toml` in the current directory or its nearest parent.
+pub fn find_config() -> anyhow::Result<Option<PathBuf>> {
+    Ok(match std::env::var_os("REFX_CONFIG") {
         Some(p) => Some(std::path::absolute(PathBuf::from(p))?),
-        None => {
-            let cwd = std::env::current_dir()?;
-            cwd.ancestors().map(|d| d.join(CONFIG_FILE)).find(|p| p.is_file())
+        None => std::env::current_dir()?.ancestors().map(|d| d.join(CONFIG_FILE)).find(|p| p.is_file()),
+    })
+}
+
+/// The daemon's registry of projects, `name = "<path to refx.toml>"`: `$REFX_REGISTRY` or
+/// `~/.config/refx/projects.toml`. `refx up` adds the current project.
+pub fn registry_path() -> PathBuf {
+    std::env::var_os("REFX_REGISTRY").map(PathBuf::from).unwrap_or_else(|| {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        home.join(".config/refx/projects.toml")
+    })
+}
+
+#[derive(Default, serde::Deserialize, serde::Serialize)]
+struct Registry {
+    #[serde(default)]
+    projects: BTreeMap<String, PathBuf>,
+}
+
+/// Registered projects: name -> `refx.toml`.
+pub fn registry() -> anyhow::Result<BTreeMap<String, PathBuf>> {
+    let p = registry_path();
+    if !p.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let r: Registry = toml::from_str(&std::fs::read_to_string(&p)?)?;
+    Ok(r.projects)
+}
+
+/// Add or update a project; returns whether the registry changed.
+pub fn register(name: &str, file: &Path) -> anyhow::Result<bool> {
+    let mut projects = registry()?;
+    let file = std::path::absolute(file)?;
+    if let Some(old) = projects.get(name) {
+        if *old == file {
+            return Ok(false);
+        }
+        eprintln!("refx: project {name} moves from {} to {}", old.display(), file.display());
+    }
+    projects.insert(name.to_string(), file);
+    let p = registry_path();
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    let tmp = p.with_extension("toml.part");
+    std::fs::write(&tmp, toml::to_string(&Registry { projects })?)?;
+    std::fs::rename(tmp, p)?;
+    Ok(true)
+}
+
+/// The project of the command line: found from the current directory.
+static DEFAULT: LazyLock<Arc<Project>> = LazyLock::new(|| {
+    let load = || -> anyhow::Result<Arc<Project>> {
+        match find_config()? {
+            Some(file) => Project::load(&file),
+            None => Ok(Arc::new(Project { root: std::env::current_dir()?, cfg: Config::default() })),
         }
     };
-    let Some(file) = file else {
-        return Ok(Loaded { root: std::env::current_dir()?, cfg: Config::default() });
-    };
-    let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
-    let cfg = toml::from_str(&text).with_context(|| format!("parsing {}", file.display()))?;
-    Ok(Loaded { root: file.parent().unwrap_or(Path::new(".")).to_path_buf(), cfg })
+    load().unwrap_or_else(|e| {
+        eprintln!("refx: {e:#}");
+        std::process::exit(2);
+    })
+});
+
+thread_local! {
+    /// The project a daemon thread is serving right now (see `enter`).
+    static CURRENT: RefCell<Option<Arc<Project>>> = const { RefCell::new(None) };
 }
 
-pub fn config() -> &'static Config {
-    &LOADED.cfg
+/// Makes `p` the project of every config lookup on this thread until the guard drops; the
+/// daemon enters a project around each request. Lookups on other threads (rayon) still see
+/// the command-line project, so code reached from a request must not read config on them;
+/// today only the vector scan runs there, and it reads none.
+pub fn enter(p: Arc<Project>) -> Scope {
+    Scope(CURRENT.with(|c| c.replace(Some(p))))
+}
+
+pub struct Scope(Option<Arc<Project>>);
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        CURRENT.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+pub fn project() -> Arc<Project> {
+    CURRENT.with(|c| c.borrow().clone()).unwrap_or_else(|| DEFAULT.clone())
 }
 
 /// The project root: the directory of `refx.toml`.
 pub fn root() -> PathBuf {
-    LOADED.root.clone()
+    project().root.clone()
 }
 
 /// How the project's docs spell the peers directory in citations (`references`).
-pub fn peers_prefix() -> &'static str {
-    config().peers.as_deref().unwrap_or("references").trim_end_matches('/')
+pub fn peers_prefix() -> String {
+    project().cfg.peers.as_deref().unwrap_or("references").trim_end_matches('/').to_string()
 }
 
 pub fn refs_dir() -> PathBuf {
@@ -119,7 +206,10 @@ pub fn refs_dir() -> PathBuf {
 pub fn home() -> PathBuf {
     std::env::var_os("REFX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| root().join(config().home.as_deref().unwrap_or(".refx")))
+        .unwrap_or_else(|| {
+            let p = project();
+            p.root.join(p.cfg.home.as_deref().unwrap_or(".refx"))
+        })
 }
 
 /// A tree of files to index: a peer repo under the peers directory, or one of the project's
@@ -138,7 +228,7 @@ pub struct Area {
 }
 
 pub fn areas() -> anyhow::Result<BTreeMap<String, Area>> {
-    Ok(config().areas.clone())
+    Ok(project().cfg.areas.clone())
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -149,11 +239,11 @@ pub struct Concept {
 
 /// Project vocabulary <-> peer names (`[concepts.<name>]`).
 pub fn concepts() -> anyhow::Result<BTreeMap<String, Concept>> {
-    Ok(config().concepts.clone())
+    Ok(project().cfg.concepts.clone())
 }
 
-pub fn own_dirs() -> &'static [String] {
-    &config().own
+pub fn own_dirs() -> Vec<String> {
+    project().cfg.own.clone()
 }
 
 /// A configured project path split into (own source `@<dir>`, path inside it).
@@ -167,27 +257,29 @@ fn in_own(path: &str) -> Option<(String, String)> {
 
 /// ADR directory as (source, dir inside it), e.g. (`@docs`, `adr`).
 pub fn adr_dir() -> Option<(String, String)> {
-    in_own(config().entities.adr_dir.as_deref()?)
+    in_own(project().cfg.entities.adr_dir.as_deref()?)
 }
 
 /// Failure-class list as (source, path inside it).
 pub fn failure_classes_doc() -> Option<(String, String)> {
-    in_own(config().entities.failure_classes.as_deref()?)
+    in_own(project().cfg.entities.failure_classes.as_deref()?)
 }
 
 /// Decisions TSV as (source, path inside it).
 pub fn decisions_doc() -> Option<(String, String)> {
-    in_own(config().entities.decisions.as_deref()?)
+    in_own(project().cfg.entities.decisions.as_deref()?)
 }
 
 pub fn failure_classes_path() -> anyhow::Result<PathBuf> {
-    let p = config().entities.failure_classes.as_deref()
+    let p = project();
+    let f = p.cfg.entities.failure_classes.as_deref()
         .ok_or_else(|| anyhow::anyhow!("no entities.failure_classes in {CONFIG_FILE}"))?;
-    Ok(root().join(p))
+    Ok(p.root.join(f))
 }
 
 pub fn ledger_path() -> Option<PathBuf> {
-    config().entities.ledger.as_deref().map(|p| root().join(p))
+    let p = project();
+    p.cfg.entities.ledger.as_deref().map(|l| p.root.join(l))
 }
 
 /// Where a hit lives, as this project cites it: `references/<repo>/<path>` or `docs/<path>`.
@@ -260,7 +352,7 @@ pub fn lang_of(repo: &str, path: &str) -> Option<&'static str> {
         | "hlsli" | "metal" | "sksl" | "idl" | "webidl" | "aidl" | "mojom" | "proto" | "qml"
         | "slint" | "rsx" | "splash" | "css" | "scss" | "less" => "plain",
         "txt" if own || TXT_ONLY_UNDER.iter().any(|m| path.contains(m)) => "doc",
-        "xml" if config().xml_repos.iter().any(|r| r == repo) => "doc",
+        "xml" if project().cfg.xml_repos.iter().any(|r| r == repo) => "doc",
         "tsv" if own => "tsv",
         "sh" | "html" | "log" if own => "plain",
         _ => return None,

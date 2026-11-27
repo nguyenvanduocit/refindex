@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params_from_iter, types::Value};
@@ -140,13 +141,39 @@ pub struct Engine {
     fts: Fts,
     paths: Paths,
     vectors: Option<Vectors>,
-    embedder: Option<Embedder>,
     nchunks: f64,
     /// Concept expansions the last BM25 query used, for display.
     pub last_expansion: Vec<String>,
     /// Cross-encoder rerank of the fused top (hybrid mode).
     pub rerank: bool,
-    reranker: Option<Reranker>,
+}
+
+/// The models are the same for every project, so a daemon serving several projects loads each
+/// once. A mutex per model: the device runs one batch at a time anyway.
+static EMBEDDER: OnceLock<Mutex<Embedder>> = OnceLock::new();
+static RERANKER: OnceLock<Mutex<Reranker>> = OnceLock::new();
+
+fn shared_model<T>(cell: &'static OnceLock<Mutex<T>>, load: fn() -> Result<T>) -> Result<&'static Mutex<T>> {
+    static LOADING: Mutex<()> = Mutex::new(());
+    if let Some(m) = cell.get() {
+        return Ok(m);
+    }
+    let _one = LOADING.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(m) = cell.get() {
+        return Ok(m);
+    }
+    let _ = cell.set(Mutex::new(load()?));
+    Ok(cell.get().unwrap())
+}
+
+/// Load both models now; a daemon does this at start rather than on the first query.
+pub fn warm_models() {
+    if let Err(e) = shared_model(&EMBEDDER, Embedder::load) {
+        eprintln!("refx: embedder not loaded: {e:#}");
+    }
+    if let Err(e) = shared_model(&RERANKER, Reranker::load) {
+        eprintln!("refx: reranker not loaded: {e:#}");
+    }
 }
 
 const HIT_COLS: &str = "c.id, r.name, f.path, c.start, c.end, c.kind, c.qualname, f.is_test, c.hash";
@@ -185,8 +212,8 @@ impl Engine {
         let db = store::open(&paths.db, true)?;
         let fts = Fts::open(&paths.fts, true)?;
         let nchunks: f64 = db.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get::<_, i64>(0))? as f64;
-        Ok(Engine { db, fts, paths, vectors: None, embedder: None, nchunks: nchunks.max(1.0),
-                    last_expansion: vec![], rerank: true, reranker: None })
+        Ok(Engine { db, fts, paths, vectors: None, nchunks: nchunks.max(1.0),
+                    last_expansion: vec![], rerank: true })
     }
 
     fn hydrate(&self, ids: &[i64]) -> Result<HashMap<i64, Hit>> {
@@ -289,10 +316,9 @@ impl Engine {
     }
 
     pub fn embed_query(&mut self, q: &str) -> Result<Vec<f32>> {
-        if self.embedder.is_none() {
-            self.embedder = Some(Embedder::load()?);
-        }
-        Ok(self.embedder.as_ref().unwrap().encode(&[q.to_string()])?.remove(0))
+        let e = shared_model(&EMBEDDER, Embedder::load)?;
+        let v = e.lock().unwrap_or_else(|p| p.into_inner()).encode(&[q.to_string()])?.remove(0);
+        Ok(v)
     }
 
     fn vec_search(&mut self, query: &str, f: &Filter) -> Result<Vec<i64>> {
@@ -483,11 +509,9 @@ impl Engine {
                 uniq.push((h.hash.clone(), self.rerank_text(h)));
             }
         }
-        if self.reranker.is_none() {
-            self.reranker = Some(Reranker::load()?);
-        }
         let docs: Vec<String> = uniq.iter().map(|u| u.1.clone()).collect();
-        let scores = self.reranker.as_ref().unwrap().score(query, &docs)?;
+        let scores = shared_model(&RERANKER, Reranker::load)?
+            .lock().unwrap_or_else(|p| p.into_inner()).score(query, &docs)?;
         let mut order: Vec<(f32, i64)> = hits.iter().map(|h| (scores[idx[&h.hash]], h.id)).collect();
         order.sort_by(|a, b| b.0.total_cmp(&a.0));
         for (rank, (s, id)) in order.into_iter().enumerate() {

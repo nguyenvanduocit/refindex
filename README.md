@@ -116,14 +116,41 @@ refx concepts invalidation   # what BM25 also searches for this word
   tied to a peer bug the docs mention (`+known-bug`) move up; sections of superseded ADRs
   (`-superseded`) move down so the decision in force ranks first.
 
-Agents use the MCP server `refx mcp` (stdio), with tools `ref_search`, `ref_peers`,
-`ref_failure_class`, `ref_about`, `ref_concepts`, `ref_def`, `ref_refs`, `ref_related`,
-`ref_read`, `ref_bug`, `ref_repos`. Register it with the project as the working directory, or
-set `REFX_CONFIG`:
+Agents use the MCP tools `ref_search`, `ref_peers`, `ref_failure_class`, `ref_about`,
+`ref_concepts`, `ref_def`, `ref_refs`, `ref_related`, `ref_read`, `ref_bug`, `ref_repos`.
+
+**One daemon for every project (recommended).** `refx serve` serves each registered project at
+`http://127.0.0.1:7311/mcp/<project>`. The models load once for all projects and each
+project's index once for all its sessions, so a search costs no model or index load.
+`refx up`, run in a project, registers it in `~/.config/refx/projects.toml` (name: `name` in
+`refx.toml`, else the directory name), starts the daemon if it is not running, and prints
+the URL. Per project:
+
+```sh
+cp target/release/refx ~/.local/bin/       # once: a refx on PATH
+cd <project> && refx up                    # -> http://127.0.0.1:7311/mcp/<project>
+```
 
 ```json
-{ "mcpServers": { "refindex": { "command": "refx", "args": ["mcp"] } } }
+// <project>/.mcp.json
+{ "mcpServers": { "refindex": { "type": "http", "url": "http://127.0.0.1:7311/mcp/<project>" } } }
 ```
+
+```json
+// <project>/.claude/settings.json: start the daemon with each session
+{ "hooks": { "SessionStart": [ { "hooks": [
+  { "type": "command", "command": "cd \"$CLAUDE_PROJECT_DIR\" && refx up >/dev/null 2>&1 || true" }
+] } ] } }
+```
+
+The hook, not launchd, starts the daemon on purpose: on macOS a launchd agent needs its own
+privacy grant to read an index on an external volume and blocks in `dyld` without one, while
+a daemon started from the session inherits the session's access. The daemon reopens a
+project's index when it is rebuilt and reloads vectors as they grow. Stop it with
+`pkill -f "refx serve"`; log in `~/.config/refx/serve.log`.
+
+**Stdio, one process per session:** `{ "command": "refx", "args": ["mcp"] }`, with the
+project as the working directory or `REFX_CONFIG` set.
 
 The embedding model `ibm-granite/granite-embedding-small-english-r2` (ModernBERT, 384 dims,
 CLS pooling) is read from the Hugging Face cache or downloaded into the index home.
