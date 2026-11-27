@@ -534,6 +534,9 @@ pub fn embed(paths: &Paths, limit: Option<usize>, batch: usize, devices: &[Strin
     std::thread::scope(|s| -> Result<()> {
         let workers: Vec<_> = models.into_iter().map(|(name, model)| {
             let (out, parts, next, done) = (&out, &parts, &next, &done);
+            // Reading sources and tokenizing stay inline: a separate preparer thread measured no
+            // faster (Metal 6000 chunks: 88/89 s inline vs 86/92 s pipelined), the device is the
+            // bottleneck.
             s.spawn(move || -> Result<usize> {
                 let mut files: HashMap<(String, String), String> = HashMap::new();
                 let mut mine = 0;
