@@ -106,6 +106,15 @@ impl Link {
         Ok(())
     }
 
+    fn close(&self) {
+        if let Some((id, version)) = self.session.lock().unwrap().take() {
+            let _ = self.agent.delete(&self.url)
+                .header("Mcp-Session-Id", &id)
+                .header("MCP-Protocol-Version", &version)
+                .call();
+        }
+    }
+
     fn forward(&self, line: &str) -> Result<Vec<String>> {
         match self.post(line, false) {
             Ok(Reply::Messages(m)) => return Ok(m),
@@ -161,6 +170,9 @@ pub fn connect(addr: &str) -> Result<()> {
             }
         }
     }
+    // The client is gone: close the session now instead of leaving it to the daemon's idle
+    // timeout (rmcp drops a silent session after 5 minutes).
+    link.close();
     Ok(())
 }
 
