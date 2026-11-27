@@ -133,6 +133,9 @@ pub fn connect(addr: &str) -> Result<()> {
     let url = crate::mcp::ensure_daemon(addr)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
+        // A hung daemon must not keep `connect` (and its client) waiting forever; a search
+        // takes seconds, a cold index open well under a minute.
+        .timeout_global(Some(std::time::Duration::from_secs(120)))
         .build()
         .into();
     let link = Arc::new(Link {
@@ -143,6 +146,7 @@ pub fn connect(addr: &str) -> Result<()> {
         init: Mutex::new(None),
         out: Mutex::new(std::io::stdout()),
     });
+    let mut inflight = vec![];
     for line in std::io::stdin().lock().lines() {
         let line = line?;
         if line.trim().is_empty() {
@@ -162,16 +166,21 @@ pub fn connect(addr: &str) -> Result<()> {
             Some("notifications/initialized") => {}
             _ => {
                 let link = link.clone();
-                std::thread::spawn(move || match link.forward(&line) {
+                inflight.retain(|t: &std::thread::JoinHandle<()>| !t.is_finished());
+                inflight.push(std::thread::spawn(move || match link.forward(&line) {
                     Ok(msgs) => msgs.iter().for_each(|m| link.emit(m)),
                     Err(e) if !msg["id"].is_null() => link.emit(&error_reply(&msg, &e)),
                     Err(e) => eprintln!("refx connect: {e:#}"),
-                });
+                }));
             }
         }
     }
-    // The client is gone: close the session now instead of leaving it to the daemon's idle
-    // timeout (rmcp drops a silent session after 5 minutes).
+    // End of input: answer the requests already sent, then close the session now instead of
+    // leaving it to the daemon's idle timeout (rmcp drops a silent session after 5 minutes).
+    // If the client died, its stdout is closed and these writes fail quietly.
+    for t in inflight {
+        let _ = t.join();
+    }
     link.close();
     Ok(())
 }
