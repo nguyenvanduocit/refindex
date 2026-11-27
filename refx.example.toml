@@ -1,0 +1,35 @@
+# refx.toml: put it at the project root. Every key is optional; paths are relative to this file.
+
+# One checkout per peer repo, e.g. references/taffy, references/chromium.
+peers = "references"
+# Index home (graph db, tantivy dir, vectors, model cache). Keep it out of version control.
+home = ".refx"
+# The project's own document trees, indexed as @docs, @notes.
+own = ["docs", "notes"]
+# Peer repos whose .xml files are design documents (protocol specs).
+xml_repos = []
+
+# Text the MCP server gives agents on connect. Unset: a generic description of the tools.
+# mcp_instructions = """..."""
+
+# Project vocabulary that becomes graph entities (`refx about ...`). Paths must lie in an `own` tree.
+[entities]
+adr_dir = "docs/adr"                          # 0012-title.md, with a `Status:` line
+failure_classes = "docs/failure-classes.md"   # `N. **Title.** question` items under `## Section`s
+decisions = "docs/decisions.tsv"              # D012<TAB>...
+# ledger = "tasks.json"                       # {"tasks": {"T42": {"title": "...", "status": "..."}}}
+
+# Work areas mapped onto peer files. Each glob matches the lowercased "repo/path" of a file
+# (SQLite GLOB: * matches across directories). `refx ... --area layout` keeps only these files.
+[areas.layout]
+about = "Layout engines and incremental relayout"
+globs = ["taffy/*", "yoga/*", "flutter/*/rendering/*", "*layout*"]
+
+[areas.ours]
+about = "This project's own docs"
+globs = ["@docs/*", "@notes/*"]
+
+# Project vocabulary <-> the names peers use. A query word that matches any term of a group
+# also searches the others (BM25 only, at reduced weight).
+[concepts.invalidation]
+terms = ["invalidate", "dirty", "markNeedsLayout", "SetNeedsLayout", "queue_resize", "request_layout"]

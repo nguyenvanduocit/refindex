@@ -1,0 +1,4 @@
+/target
+/.refx
+# Machine-local build settings (e.g. a target-dir on another volume).
+/.cargo/
